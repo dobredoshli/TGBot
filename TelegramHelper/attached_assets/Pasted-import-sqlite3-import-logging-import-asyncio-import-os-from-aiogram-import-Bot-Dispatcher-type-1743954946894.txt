@@ -1,0 +1,148 @@
+import sqlite3
+import logging
+import asyncio
+import os
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+# Settings
+TOKEN = "7743710220:AAEKNuBz6kN0vMs-bd_zIfUKcknF47rwfUo"
+ADMIN_ID = [5791051959]  # List of administrator IDs
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logging.info("Bot is starting...")
+
+# Database path
+db_path = os.path.join(os.path.dirname(__file__), 'loyalty.db')
+conn = sqlite3.connect(db_path, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cursor = conn.cursor()
+
+# Function to create the table
+def create_table():
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        hours REAL DEFAULT 0
+    );''')
+    conn.commit()
+    logging.info("Table 'users' created or already exists.")
+
+# Create table on startup
+create_table()
+
+# Bot initialization
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# Keyboards
+hour_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="1"), KeyboardButton(text="2"), KeyboardButton(text="3"), KeyboardButton(text="4")],
+        [KeyboardButton(text="More")]
+    ], resize_keyboard=True
+)
+
+minute_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="0 minutes"), KeyboardButton(text="15 minutes"),
+         KeyboardButton(text="30 minutes"), KeyboardButton(text="45 minutes")]
+    ], resize_keyboard=True
+)
+
+client_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Log Hours"), KeyboardButton(text="Check Hours")]], resize_keyboard=True
+)
+
+admin_confirm_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="✅ Confirm"), KeyboardButton(text="❌ Reject")]], resize_keyboard=True
+)
+
+pending_requests = {}  # Store pending hour confirmations
+user_selection = {}  # Store temporary user selections
+
+@dp.message(lambda message: message.text in ["Start", "/start"])
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        cursor.execute("INSERT INTO users (user_id, hours) VALUES (?, 0)", (user_id,))
+        conn.commit()
+    await message.answer("Welcome!", reply_markup=client_kb)
+
+@dp.message(lambda message: message.text == "Log Hours")
+async def request_hours(message: types.Message):
+    await message.answer("Select the number of full hours:", reply_markup=hour_kb)
+
+@dp.message(lambda message: message.text == "Check Hours")
+async def check_hours(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT hours FROM users WHERE user_id = ?", (user_id,))
+    hours = cursor.fetchone()["hours"]
+    full_hours = int(hours)
+    minutes = int((hours - full_hours) * 60)
+    await message.answer(f"You have {full_hours} hours and {minutes} minutes in the studio.", reply_markup=client_kb)
+
+@dp.message(lambda message: message.text.isdigit() or message.text == "More")
+async def select_hours(message: types.Message):
+    user_id = message.from_user.id
+    if message.text == "More":
+        await message.answer("Enter the number of hours manually:")
+    else:
+        user_selection[user_id] = float(message.text)
+        await message.answer("Now select the minutes:", reply_markup=minute_kb)
+
+@dp.message(lambda message: message.text in ["0 minutes", "15 minutes", "30 minutes", "45 minutes"])
+async def select_minutes(message: types.Message):
+    user_id = message.from_user.id
+    minutes = {"0 minutes": 0, "15 minutes": 0.25, "30 minutes": 0.5, "45 minutes": 0.75}[message.text]
+    total_hours = user_selection.get(user_id, 0) + minutes
+    pending_requests[user_id] = total_hours
+
+    for admin in ADMIN_ID:
+        await bot.send_message(admin,
+                               f"User @{message.from_user.username} logged {total_hours} hours. Confirm?",
+                               reply_markup=admin_confirm_kb)
+
+    await message.answer("Your hours have been sent for admin approval.")
+
+@dp.message(lambda message: message.text in ["✅ Confirm", "❌ Reject"])
+async def confirm_hours(message: types.Message):
+    if message.from_user.id not in ADMIN_ID:
+        return
+    if not pending_requests:
+        await message.answer("No hours pending approval.")
+        return
+
+    user_id, hours = pending_requests.popitem()
+    if user_id == message.from_user.id:
+        await message.answer("You cannot confirm your own hours.")
+        return
+
+    if message.text == "✅ Confirm":
+        cursor.execute("SELECT hours FROM users WHERE user_id = ?", (user_id,))
+        current_hours = cursor.fetchone()["hours"]
+        new_hours = current_hours + hours
+        free_hours = int(new_hours // 8)
+        remaining_hours = new_hours % 8
+        cursor.execute("UPDATE users SET hours = ? WHERE user_id = ?", (remaining_hours, user_id))
+        conn.commit()
+        full_hours = int(remaining_hours)
+        minutes = int((remaining_hours - full_hours) * 60)
+        await bot.send_message(user_id,
+                               f"Your hours have been confirmed! You have {free_hours} free hour(s) and {full_hours} hours {minutes} minutes recorded for further discounts.",
+                               reply_markup=client_kb)
+    else:
+        await bot.send_message(user_id, "Your hours were not approved by the admin.", reply_markup=client_kb)
+    await message.answer("Record processed.")
+
+async def main():
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"Error starting bot: {e}")
+
+if __name__ == "__main__":
+    logging.info("Starting bot...")
+    asyncio.run(main())
